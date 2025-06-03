@@ -11,12 +11,18 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/aws/aws-lambda-go/lambda"
 	"github.com/google/uuid"
+)
+
+var (
+	AppConfig Config
+	htmlTagRe = regexp.MustCompile(`<.*?>`)
 )
 
 type Config struct {
@@ -49,35 +55,6 @@ type SwitchBotDeviceStatus struct {
 	CO2         int     `json:"CO2"`
 }
 
-var AppConfig Config
-
-func initConfig() error {
-	if isLambda() {
-		AppConfig = Config{
-			SwitchBotToken:  os.Getenv("SWITCHBOT_API_TOKEN"),
-			SwitchBotSecret: os.Getenv("SWITCHBOT_API_SECRET"),
-			MastodonURL:     os.Getenv("MASTODON_API_URL"),
-			MastodonToken:   os.Getenv("MASTODON_ACCESS_TOKEN"),
-		}
-	} else {
-		file, err := os.Open("config.json")
-		if err != nil {
-			return err
-		}
-		defer file.Close()
-
-		decoder := json.NewDecoder(file)
-		if err := decoder.Decode(&AppConfig); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func isLambda() bool {
-	return os.Getenv("AWS_LAMBDA_FUNCTION_NAME") != ""
-}
-
 func main() {
 	if isLambda() {
 		lambda.Start(handler)
@@ -86,6 +63,10 @@ func main() {
 			fmt.Println("Error:", err)
 		}
 	}
+}
+
+func isLambda() bool {
+	return os.Getenv("AWS_LAMBDA_FUNCTION_NAME") != ""
 }
 
 func handler(ctx context.Context) error {
@@ -112,6 +93,29 @@ func handler(ctx context.Context) error {
 		}
 	}
 
+	return nil
+}
+
+func initConfig() error {
+	if isLambda() {
+		AppConfig = Config{
+			SwitchBotToken:  os.Getenv("SWITCHBOT_API_TOKEN"),
+			SwitchBotSecret: os.Getenv("SWITCHBOT_API_SECRET"),
+			MastodonURL:     os.Getenv("MASTODON_API_URL"),
+			MastodonToken:   os.Getenv("MASTODON_ACCESS_TOKEN"),
+		}
+	} else {
+		file, err := os.Open("config.json")
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+
+		decoder := json.NewDecoder(file)
+		if err := decoder.Decode(&AppConfig); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -200,11 +204,23 @@ func generateStatusMessage(device Device) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	msg := fmt.Sprintf(`# %s (🔋%d%%)
+
+	posts, err := fetchLatestPosts(device.DeviceName)
+	if err != nil {
+		return "", fmt.Errorf("fetchLatestPosts failed: %w", err)
+	}
+
+	emoji := "🔋"
+	if isRepeated(status, posts) {
+		emoji = "⚠️"
+	}
+
+	msg := fmt.Sprintf(`# %s (%s%d%%)
 温度: %.1f度
 湿度: %.1f%%
 `,
 		device.DeviceName,
+		emoji,
 		status.Battery,
 		status.Temperature,
 		status.Humidity,
@@ -238,4 +254,102 @@ func postToMastodon(message string) error {
 	}
 	fmt.Println("Post successful:", message)
 	return nil
+}
+
+func fetchLatestPosts(deviceName string) ([]string, error) {
+	var verifyResp struct {
+		ID string `json:"id"`
+	}
+	if err := httpGet("/accounts/verify_credentials", &verifyResp); err != nil {
+		return nil, err
+	}
+
+	var statuses []struct {
+		Content string `json:"content"`
+	}
+	if err := httpGet(fmt.Sprintf("/accounts/%s/statuses?limit=3", verifyResp.ID), &statuses); err != nil {
+		return nil, err
+	}
+
+	var posts []string
+	for _, s := range statuses {
+		text := stripHTMLTags(s.Content)
+		if idx := strings.Index(text, "# "+deviceName); idx != -1 {
+			posts = append(posts, text[idx:])
+			if len(posts) == 3 {
+				break
+			}
+		}
+	}
+	return posts, nil
+}
+
+func httpGet(endpoint string, result any) error {
+	url := AppConfig.MastodonURL + endpoint
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+AppConfig.MastodonToken)
+
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode >= 300 {
+		body, _ := io.ReadAll(res.Body)
+		return fmt.Errorf("GET %s failed: %s", url, body)
+	}
+
+	if err := json.NewDecoder(res.Body).Decode(result); err != nil {
+		return fmt.Errorf("decode %s: %w", endpoint, err)
+	}
+	return nil
+}
+
+func stripHTMLTags(input string) string {
+	return htmlTagRe.ReplaceAllString(input, "")
+}
+
+func isRepeated(current SwitchBotDeviceStatus, previousPosts []string) bool {
+	if len(previousPosts) < 3 {
+		return false
+	}
+
+	var temps []float64
+	var hums []float64
+
+	for _, post := range previousPosts {
+		temp := extractFloatValue(post, `温度: ([\d.]+)度`)
+		hum := extractFloatValue(post, `湿度: ([\d.]+)%`)
+		if temp == nil || hum == nil {
+			fmt.Println("数値の抽出に失敗しました:", post)
+			return false
+		}
+		temps = append(temps, *temp)
+		hums = append(hums, *hum)
+	}
+
+	for i := 0; i < 3; i++ {
+		if temps[i] != current.Temperature ||
+			hums[i] != current.Humidity {
+			return false
+		}
+	}
+	return true
+}
+
+func extractFloatValue(text, pattern string) *float64 {
+	matches := regexp.MustCompile(pattern).FindStringSubmatch(text)
+	if len(matches) < 2 {
+		return nil
+	}
+	v, err := strconv.ParseFloat(matches[1], 64)
+	if err != nil {
+		return nil
+	}
+	return &v
 }
