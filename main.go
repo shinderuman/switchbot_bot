@@ -20,6 +20,10 @@ import (
 	"github.com/google/uuid"
 )
 
+const (
+	batteryCheckPostCount = 5
+)
+
 var (
 	AppConfig Config
 	htmlTagRe = regexp.MustCompile(`<.*?>`)
@@ -58,10 +62,8 @@ type SwitchBotDeviceStatus struct {
 func main() {
 	if isLambda() {
 		lambda.Start(handler)
-	} else {
-		if err := handler(context.Background()); err != nil {
-			fmt.Println("Error:", err)
-		}
+	} else if err := handler(context.Background()); err != nil {
+		fmt.Println("Error:", err)
 	}
 }
 
@@ -70,17 +72,18 @@ func isLambda() bool {
 }
 
 func handler(ctx context.Context) error {
-	initConfig()
+	if err := initConfig(); err != nil {
+		return fmt.Errorf("initConfig error: %w", err)
+	}
 
-	statusMessages := []string{}
 	devices, err := fetchDevices()
 	if err != nil {
 		return fmt.Errorf("fetchDevices error: %w", err)
 	}
 
-	targetDeviceTypes := map[string]bool{"MeterPro(CO2)": true, "Meter": true}
+	var statusMessages []string
 	for _, d := range devices {
-		if targetDeviceTypes[d.DeviceType] {
+		if isTargetDevice(d.DeviceType) {
 			if msg, err := generateStatusMessage(d); err == nil {
 				statusMessages = append(statusMessages, msg)
 			}
@@ -104,19 +107,15 @@ func initConfig() error {
 			MastodonURL:     os.Getenv("MASTODON_API_URL"),
 			MastodonToken:   os.Getenv("MASTODON_ACCESS_TOKEN"),
 		}
-	} else {
-		file, err := os.Open("config.json")
-		if err != nil {
-			return err
-		}
-		defer file.Close()
-
-		decoder := json.NewDecoder(file)
-		if err := decoder.Decode(&AppConfig); err != nil {
-			return err
-		}
+		return nil
 	}
-	return nil
+
+	file, err := os.Open("config.json")
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	return json.NewDecoder(file).Decode(&AppConfig)
 }
 
 func fetchDevices() ([]Device, error) {
@@ -178,6 +177,14 @@ func requestWithBackoff[T any](url string, headers map[string]string, out *Switc
 		}
 	}
 	return fmt.Errorf("unreachable: requestWithBackoff fell through")
+}
+
+func isTargetDevice(t string) bool {
+	switch t {
+	case "Meter", "MeterPro(CO2)":
+		return true
+	}
+	return false
 }
 
 func generateSwitchBotHeaders() map[string]string {
@@ -267,7 +274,7 @@ func fetchLatestPosts(deviceName string) ([]string, error) {
 	var statuses []struct {
 		Content string `json:"content"`
 	}
-	if err := httpGet(fmt.Sprintf("/accounts/%s/statuses?limit=3", verifyResp.ID), &statuses); err != nil {
+	if err := httpGet(fmt.Sprintf("/accounts/%s/statuses?limit=%d", verifyResp.ID, batteryCheckPostCount), &statuses); err != nil {
 		return nil, err
 	}
 
@@ -276,7 +283,7 @@ func fetchLatestPosts(deviceName string) ([]string, error) {
 		text := stripHTMLTags(s.Content)
 		if idx := strings.Index(text, "# "+deviceName); idx != -1 {
 			posts = append(posts, text[idx:])
-			if len(posts) == 3 {
+			if len(posts) == batteryCheckPostCount {
 				break
 			}
 		}
@@ -304,10 +311,7 @@ func httpGet(endpoint string, result any) error {
 		return fmt.Errorf("GET %s failed: %s", url, body)
 	}
 
-	if err := json.NewDecoder(res.Body).Decode(result); err != nil {
-		return fmt.Errorf("decode %s: %w", endpoint, err)
-	}
-	return nil
+	return json.NewDecoder(res.Body).Decode(result)
 }
 
 func stripHTMLTags(input string) string {
@@ -315,7 +319,7 @@ func stripHTMLTags(input string) string {
 }
 
 func isRepeated(current SwitchBotDeviceStatus, previousPosts []string) bool {
-	if len(previousPosts) < 3 {
+	if len(previousPosts) < batteryCheckPostCount {
 		return false
 	}
 
@@ -333,7 +337,7 @@ func isRepeated(current SwitchBotDeviceStatus, previousPosts []string) bool {
 		hums = append(hums, *hum)
 	}
 
-	for i := 0; i < 3; i++ {
+	for i := 0; i < batteryCheckPostCount; i++ {
 		if temps[i] != current.Temperature ||
 			hums[i] != current.Humidity {
 			return false
