@@ -36,7 +36,7 @@ type Config struct {
 	MastodonToken   string
 }
 
-type Device struct {
+type SwitchBotDevice struct {
 	DeviceID   string `json:"deviceId"`
 	DeviceType string `json:"deviceType"`
 	DeviceName string `json:"deviceName"`
@@ -49,14 +49,14 @@ type SwitchBotResponse[T any] struct {
 }
 
 type SwitchBotDeviceListBody struct {
-	DeviceList []Device `json:"deviceList"`
+	DeviceList []SwitchBotDevice `json:"deviceList"`
 }
 
 type SwitchBotDeviceStatus struct {
-	Battery     int     `json:"battery"`
-	Temperature float64 `json:"temperature"`
-	Humidity    float64 `json:"humidity"`
-	CO2         int     `json:"CO2"`
+	Battery     *int     `json:"battery,omitempty"`
+	Temperature *float64 `json:"temperature,omitempty"`
+	Humidity    *float64 `json:"humidity,omitempty"`
+	CO2         *int     `json:"CO2,omitempty"`
 }
 
 func main() {
@@ -118,7 +118,7 @@ func initConfig() error {
 	return json.NewDecoder(file).Decode(&AppConfig)
 }
 
-func fetchDevices() ([]Device, error) {
+func fetchDevices() ([]SwitchBotDevice, error) {
 	url := "https://api.switch-bot.com/v1.1/devices"
 	var resp SwitchBotResponse[SwitchBotDeviceListBody]
 	if err := requestWithBackoff(url, generateSwitchBotHeaders(), &resp); err != nil {
@@ -127,7 +127,7 @@ func fetchDevices() ([]Device, error) {
 	return resp.Body.DeviceList, nil
 }
 
-func fetchDeviceStatus(device Device) (SwitchBotDeviceStatus, error) {
+func fetchDeviceStatus(device SwitchBotDevice) (SwitchBotDeviceStatus, error) {
 	url := fmt.Sprintf("https://api.switch-bot.com/v1.1/devices/%s/status", device.DeviceID)
 	var resp SwitchBotResponse[SwitchBotDeviceStatus]
 	if err := requestWithBackoff(url, generateSwitchBotHeaders(), &resp); err != nil {
@@ -206,37 +206,43 @@ func generateSwitchBotHeaders() map[string]string {
 	}
 }
 
-func generateStatusMessage(device Device) (string, error) {
+func generateStatusMessage(device SwitchBotDevice) (string, error) {
 	status, err := fetchDeviceStatus(device)
 	if err != nil {
 		return "", err
 	}
 
+	msg := "# " + device.DeviceName
+	if status.Battery != nil {
+		emoji, err := getBatteryStatusSymbol(device, status)
+		if err != nil {
+			return "", err
+		}
+		msg += fmt.Sprintf(" (%s%d%%)\n", emoji, *status.Battery)
+	}
+	if status.Temperature != nil {
+		msg += fmt.Sprintf("温度: %.1f度\n", *status.Temperature)
+	}
+	if status.Humidity != nil {
+		msg += fmt.Sprintf("湿度: %.1f%%\n", *status.Humidity)
+	}
+	if status.CO2 != nil {
+		msg += fmt.Sprintf("CO2: %dppm\n", *status.CO2)
+	}
+	fmt.Println("Generated status message:", msg)
+	return msg, nil
+}
+
+func getBatteryStatusSymbol(device SwitchBotDevice, status SwitchBotDeviceStatus) (string, error) {
 	posts, err := fetchLatestPosts(device.DeviceName)
 	if err != nil {
 		return "", fmt.Errorf("fetchLatestPosts failed: %w", err)
 	}
 
-	emoji := "🔋"
 	if isRepeated(status, posts) {
-		emoji = "⚠️"
+		return "⚠️", nil
 	}
-
-	msg := fmt.Sprintf(`# %s (%s%d%%)
-温度: %.1f度
-湿度: %.1f%%
-`,
-		device.DeviceName,
-		emoji,
-		status.Battery,
-		status.Temperature,
-		status.Humidity,
-	)
-	if status.CO2 > 0 {
-		msg += fmt.Sprintf("CO2: %dppm\n", status.CO2)
-	}
-	fmt.Println("Generated status message:", msg)
-	return msg, nil
+	return "🔋", nil
 }
 
 func postToMastodon(message string) error {
@@ -283,9 +289,6 @@ func fetchLatestPosts(deviceName string) ([]string, error) {
 		text := stripHTMLTags(s.Content)
 		if idx := strings.Index(text, "# "+deviceName); idx != -1 {
 			posts = append(posts, text[idx:])
-			if len(posts) == batteryCheckPostCount {
-				break
-			}
 		}
 	}
 	return posts, nil
@@ -319,27 +322,14 @@ func stripHTMLTags(input string) string {
 }
 
 func isRepeated(current SwitchBotDeviceStatus, previousPosts []string) bool {
-	if len(previousPosts) < batteryCheckPostCount {
-		return false
-	}
-
-	var temps []float64
-	var hums []float64
-
 	for _, post := range previousPosts {
 		temp := extractFloatValue(post, `温度: ([\d.]+)度`)
 		hum := extractFloatValue(post, `湿度: ([\d.]+)%`)
-		if temp == nil || hum == nil {
-			fmt.Println("数値の抽出に失敗しました:", post)
-			return false
-		}
-		temps = append(temps, *temp)
-		hums = append(hums, *hum)
-	}
+		co2 := extractIntValue(post, `CO2: (\d+)ppm`)
 
-	for i := 0; i < batteryCheckPostCount; i++ {
-		if temps[i] != current.Temperature ||
-			hums[i] != current.Humidity {
+		if !floatPtrEquals(temp, current.Temperature) ||
+			!floatPtrEquals(hum, current.Humidity) ||
+			!intPtrEquals(co2, current.CO2) {
 			return false
 		}
 	}
@@ -356,4 +346,36 @@ func extractFloatValue(text, pattern string) *float64 {
 		return nil
 	}
 	return &v
+}
+
+func extractIntValue(text, pattern string) *int {
+	matches := regexp.MustCompile(pattern).FindStringSubmatch(text)
+	if len(matches) < 2 {
+		return nil
+	}
+	v, err := strconv.Atoi(matches[1])
+	if err != nil {
+		return nil
+	}
+	return &v
+}
+
+func floatPtrEquals(a, b *float64) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	return *a == *b
+}
+
+func intPtrEquals(a, b *int) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	return *a == *b
 }
