@@ -18,10 +18,14 @@ import (
 	"time"
 
 	"github.com/aws/aws-lambda-go/lambda"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
 	"github.com/google/uuid"
 )
 
-const batteryCheckPostCount = 5
+const batteryCheckPostCount = 7
 
 var (
 	config            = Config{}
@@ -74,6 +78,10 @@ func main() {
 	}
 }
 
+func isLambda() bool {
+	return os.Getenv("AWS_LAMBDA_FUNCTION_NAME") != ""
+}
+
 func handler(ctx context.Context) error {
 	if err := loadConfig(); err != nil {
 		return fmt.Errorf("loadConfig error: %w", err)
@@ -83,6 +91,7 @@ func handler(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("fetchDevices error: %w", err)
 	}
+
 	posts, err := fetchRecentMastodonPosts()
 	if err != nil {
 		return fmt.Errorf("fetchRecentMastodonPosts error: %w", err)
@@ -93,7 +102,7 @@ func handler(ctx context.Context) error {
 		if !isTargetDevice(device.DeviceType) {
 			continue
 		}
-		message, err := generateStatusMessage(device, posts)
+		message, err := generateStatusMessage(ctx, device, posts)
 		if err != nil {
 			continue
 		}
@@ -105,25 +114,6 @@ func handler(ctx context.Context) error {
 		return postToMastodon(strings.Join(messages, "\n"))
 	}
 	return nil
-}
-
-func fetchRecentMastodonPosts() ([]MastodonPost, error) {
-	var verifyResp struct {
-		ID string `json:"id"`
-	}
-	if err := httpGet("/accounts/verify_credentials", &verifyResp); err != nil {
-		return nil, err
-	}
-
-	var posts []MastodonPost
-	if err := httpGet(fmt.Sprintf("/accounts/%s/statuses?limit=%d", verifyResp.ID, batteryCheckPostCount), &posts); err != nil {
-		return nil, err
-	}
-	return posts, nil
-}
-
-func isLambda() bool {
-	return os.Getenv("AWS_LAMBDA_FUNCTION_NAME") != ""
 }
 
 func loadConfig() error {
@@ -153,19 +143,119 @@ func fetchDevices() ([]SwitchBotDevice, error) {
 	return resp.Body.DeviceList, nil
 }
 
+func requestWithBackoff[T any](url string, headers map[string]string, out *SwitchBotResponse[T]) error {
+	for attempt := range 5 {
+		req, err := http.NewRequest("GET", url, nil)
+		if err != nil {
+			return fmt.Errorf("request creation failed: %w", err)
+		}
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("HTTP request failed: %w", err)
+		}
+		defer res.Body.Close()
+
+		bodyBytes, err := io.ReadAll(res.Body)
+		if err != nil {
+			return fmt.Errorf("reading response failed: %w", err)
+		}
+
+		if err := json.Unmarshal(bodyBytes, out); err != nil {
+			return fmt.Errorf("unmarshal failed: %w\nResponse body: %s", err, string(bodyBytes))
+		}
+
+		switch out.StatusCode {
+		case 100:
+			return nil
+		case 190:
+			if attempt < 4 {
+				wait := time.Duration(1<<attempt) * time.Second
+				fmt.Printf("[Retry %d/5] statusCode 190 received. Retrying after %v...\n", attempt+1, wait)
+				time.Sleep(wait)
+				continue
+			}
+			return fmt.Errorf("max retries reached for statusCode 190: %s", out.Message)
+		default:
+			return fmt.Errorf("unexpected statusCode %d: %s", out.StatusCode, out.Message)
+		}
+	}
+	return fmt.Errorf("unreachable: requestWithBackoff fell through")
+}
+
+func generateSwitchBotHeaders() map[string]string {
+	nonce := uuid.New().String()
+	timestamp := strconv.FormatInt(time.Now().UnixMilli(), 10)
+	message := config.SwitchBotToken + timestamp + nonce
+
+	h := hmac.New(sha256.New, []byte(config.SwitchBotSecret))
+	h.Write([]byte(message))
+	sign := base64.StdEncoding.EncodeToString(h.Sum(nil))
+
+	return map[string]string{
+		"Authorization": config.SwitchBotToken,
+		"Content-Type":  "application/json",
+		"charset":       "utf8",
+		"t":             timestamp,
+		"sign":          sign,
+		"nonce":         nonce,
+	}
+}
+
+func fetchRecentMastodonPosts() ([]MastodonPost, error) {
+	var verifyResp struct {
+		ID string `json:"id"`
+	}
+	if err := httpGet("/accounts/verify_credentials", &verifyResp); err != nil {
+		return nil, err
+	}
+
+	var posts []MastodonPost
+	if err := httpGet(fmt.Sprintf("/accounts/%s/statuses?limit=%d", verifyResp.ID, batteryCheckPostCount), &posts); err != nil {
+		return nil, err
+	}
+	return posts, nil
+}
+
+func httpGet(endpoint string, result any) error {
+	url := config.MastodonURL + endpoint
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+config.MastodonToken)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	if res.StatusCode >= 300 {
+		body, _ := io.ReadAll(res.Body)
+		return fmt.Errorf("GET %s failed: %s", url, body)
+	}
+	return json.NewDecoder(res.Body).Decode(result)
+}
+
 func isTargetDevice(deviceType string) bool {
 	_, ok := targetDeviceTypes[deviceType]
 	return ok
 }
 
-func generateStatusMessage(device SwitchBotDevice, posts []MastodonPost) (string, error) {
+func generateStatusMessage(ctx context.Context, device SwitchBotDevice, posts []MastodonPost) (string, error) {
 	status, err := fetchDeviceStatus(device)
 	if err != nil {
 		return "", err
 	}
 
+	if err := PutMetric(ctx, device, status); err != nil {
+		log.Printf("Failed to send metrics to CloudWatch: %v", err)
+	}
+
 	var b strings.Builder
-	fmt.Fprintf(&b, makeDeviceHeader(device.DeviceName))
+	b.WriteString(makeDeviceHeader(device.DeviceName))
 	if status.Battery != nil {
 		emoji, err := batteryStatusEmoji(device, posts, status)
 		if err != nil {
@@ -181,7 +271,16 @@ func generateStatusMessage(device SwitchBotDevice, posts []MastodonPost) (string
 		fmt.Fprintf(&b, "湿度: %.1f%%\n", *status.Humidity)
 	}
 	if status.CO2 != nil {
-		fmt.Fprintf(&b, "CO2: %dppm\n", *status.CO2)
+		var icon string
+		switch {
+		case *status.CO2 >= 1500:
+			icon = "🔥"
+		case *status.CO2 >= 1000:
+			icon = "💨"
+		default:
+			icon = "🌳"
+		}
+		fmt.Fprintf(&b, "CO2: %dppm %s\n", *status.CO2, icon)
 	}
 	return b.String(), nil
 }
@@ -193,6 +292,68 @@ func fetchDeviceStatus(device SwitchBotDevice) (SwitchBotDeviceStatus, error) {
 		return SwitchBotDeviceStatus{}, err
 	}
 	return resp.Body, nil
+}
+
+func PutMetric(ctx context.Context, device SwitchBotDevice, status SwitchBotDeviceStatus) error {
+	cfg, err := awsconfig.LoadDefaultConfig(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to load AWS config: %w", err)
+	}
+	cw := cloudwatch.NewFromConfig(cfg)
+
+	timestamp := aws.Time(time.Now())
+
+	var metricData []types.MetricDatum
+
+	if status.Temperature != nil {
+		metricData = append(metricData, types.MetricDatum{
+			MetricName: aws.String("Temperature"),
+			Dimensions: []types.Dimension{
+				{Name: aws.String("DeviceId"), Value: aws.String(device.DeviceID)},
+			},
+			Timestamp: timestamp,
+			Value:     aws.Float64(*status.Temperature),
+			Unit:      types.StandardUnitCount,
+		})
+	}
+
+	if status.Humidity != nil {
+		metricData = append(metricData, types.MetricDatum{
+			MetricName: aws.String("Humidity"),
+			Dimensions: []types.Dimension{
+				{Name: aws.String("DeviceId"), Value: aws.String(device.DeviceID)},
+			},
+			Timestamp: timestamp,
+			Value:     aws.Float64(*status.Humidity),
+			Unit:      types.StandardUnitPercent,
+		})
+	}
+
+	if status.CO2 != nil {
+		metricData = append(metricData, types.MetricDatum{
+			MetricName: aws.String("CO2"),
+			Dimensions: []types.Dimension{
+				{Name: aws.String("DeviceId"), Value: aws.String(device.DeviceID)},
+			},
+			Timestamp: timestamp,
+			Value:     aws.Float64(float64(*status.CO2)),
+			Unit:      types.StandardUnitCount,
+		})
+	}
+
+	if len(metricData) == 0 {
+		return nil
+	}
+
+	_, err = cw.PutMetricData(ctx, &cloudwatch.PutMetricDataInput{
+		Namespace:  aws.String("SwitchBotMetrics"),
+		MetricData: metricData,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to put metric data: %w", err)
+	}
+
+	return nil
 }
 
 func makeDeviceHeader(deviceName string) string {
@@ -270,68 +431,6 @@ func ptrEquals[T comparable](a, b *T) bool {
 	return *a == *b
 }
 
-func generateSwitchBotHeaders() map[string]string {
-	nonce := uuid.New().String()
-	timestamp := strconv.FormatInt(time.Now().UnixMilli(), 10)
-	message := config.SwitchBotToken + timestamp + nonce
-
-	h := hmac.New(sha256.New, []byte(config.SwitchBotSecret))
-	h.Write([]byte(message))
-	sign := base64.StdEncoding.EncodeToString(h.Sum(nil))
-
-	return map[string]string{
-		"Authorization": config.SwitchBotToken,
-		"Content-Type":  "application/json",
-		"charset":       "utf8",
-		"t":             timestamp,
-		"sign":          sign,
-		"nonce":         nonce,
-	}
-}
-
-func requestWithBackoff[T any](url string, headers map[string]string, out *SwitchBotResponse[T]) error {
-	for attempt := 0; attempt < 5; attempt++ {
-		req, err := http.NewRequest("GET", url, nil)
-		if err != nil {
-			return fmt.Errorf("request creation failed: %w", err)
-		}
-		for k, v := range headers {
-			req.Header.Set(k, v)
-		}
-
-		res, err := http.DefaultClient.Do(req)
-		if err != nil {
-			return fmt.Errorf("HTTP request failed: %w", err)
-		}
-		defer res.Body.Close()
-
-		bodyBytes, err := io.ReadAll(res.Body)
-		if err != nil {
-			return fmt.Errorf("reading response failed: %w", err)
-		}
-
-		if err := json.Unmarshal(bodyBytes, out); err != nil {
-			return fmt.Errorf("unmarshal failed: %w\nResponse body: %s", err, string(bodyBytes))
-		}
-
-		switch out.StatusCode {
-		case 100:
-			return nil
-		case 190:
-			if attempt < 4 {
-				wait := time.Duration(1<<attempt) * time.Second
-				fmt.Printf("[Retry %d/5] statusCode 190 received. Retrying after %v...\n", attempt+1, wait)
-				time.Sleep(wait)
-				continue
-			}
-			return fmt.Errorf("max retries reached for statusCode 190: %s", out.Message)
-		default:
-			return fmt.Errorf("unexpected statusCode %d: %s", out.StatusCode, out.Message)
-		}
-	}
-	return fmt.Errorf("unreachable: requestWithBackoff fell through")
-}
-
 func postToMastodon(message string) error {
 	url := config.MastodonURL + "/statuses"
 	payload := map[string]string{
@@ -350,27 +449,8 @@ func postToMastodon(message string) error {
 	defer res.Body.Close()
 	if res.StatusCode >= 300 {
 		body, _ := io.ReadAll(res.Body)
-		return fmt.Errorf("Mastodon API error: %s", body)
+		return fmt.Errorf("mastodon API error: %s", body)
 	}
 	log.Println("Post successful:", message)
 	return nil
-}
-
-func httpGet(endpoint string, result any) error {
-	url := config.MastodonURL + endpoint
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+config.MastodonToken)
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer res.Body.Close()
-	if res.StatusCode >= 300 {
-		body, _ := io.ReadAll(res.Body)
-		return fmt.Errorf("GET %s failed: %s", url, body)
-	}
-	return json.NewDecoder(res.Body).Decode(result)
 }
