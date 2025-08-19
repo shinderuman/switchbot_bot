@@ -25,22 +25,22 @@ import (
 	"github.com/google/uuid"
 )
 
-const batteryCheckPostCount = 7
-
 var (
-	config            = Config{}
-	htmlTagRe         = regexp.MustCompile(`<.*?>`)
-	targetDeviceTypes = map[string]struct{}{
+	batteryCheckPostCount = 7
+	config                = Config{}
+	htmlTagRe             = regexp.MustCompile(`<.*?>`)
+	targetDeviceTypes     = map[string]struct{}{
 		"Meter":         {},
 		"MeterPro(CO2)": {},
 	}
 )
 
 type Config struct {
-	SwitchBotToken  string
-	SwitchBotSecret string
-	MastodonURL     string
-	MastodonToken   string
+	SwitchBotToken        string
+	SwitchBotSecret       string
+	MastodonURL           string
+	MastodonToken         string
+	BatteryCheckPostCount int
 }
 
 type SwitchBotDevice struct {
@@ -118,11 +118,17 @@ func handler(ctx context.Context) error {
 
 func loadConfig() error {
 	if isLambda() {
+		if envPostCount := os.Getenv("BATTERY_CHECK_POST_COUNT"); envPostCount != "" {
+			if count, err := strconv.Atoi(envPostCount); err == nil && count > 0 {
+				batteryCheckPostCount = count
+			}
+		}
 		config = Config{
-			SwitchBotToken:  os.Getenv("SWITCHBOT_API_TOKEN"),
-			SwitchBotSecret: os.Getenv("SWITCHBOT_API_SECRET"),
-			MastodonURL:     os.Getenv("MASTODON_API_URL"),
-			MastodonToken:   os.Getenv("MASTODON_ACCESS_TOKEN"),
+			SwitchBotToken:        os.Getenv("SWITCHBOT_API_TOKEN"),
+			SwitchBotSecret:       os.Getenv("SWITCHBOT_API_SECRET"),
+			MastodonURL:           os.Getenv("MASTODON_API_URL"),
+			MastodonToken:         os.Getenv("MASTODON_ACCESS_TOKEN"),
+			BatteryCheckPostCount: batteryCheckPostCount,
 		}
 		return nil
 	}

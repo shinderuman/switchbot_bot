@@ -1,0 +1,7 @@
+{
+    "SwitchBotToken": "your_switchbot_api_token_here",
+    "SwitchBotSecret": "your_switchbot_api_secret_here",
+    "MastodonURL": "https://your-mastodon-instance.com/api/v1",
+    "MastodonToken": "your_mastodon_access_token_here",
+    "BatteryCheckPostCount": 7
+}
