@@ -6,7 +6,7 @@ SwitchBotデバイスから環境データ（温度、湿度、CO2濃度）を�
 
 - SwitchBot Meter/MeterPro(CO2)デバイスからのデータ取得
 - 環境データのMastodon投稿
-- AWS CloudWatchへのメトリクス送信
+- AWS CloudWatch Logsへの構造化ログ出力（Metric Filters用）
 - バッテリー状態の監視と警告
 - 重複投稿の防止機能
 
@@ -71,7 +71,7 @@ A Go application that retrieves environmental data (temperature, humidity, CO2 c
 
 - Data retrieval from SwitchBot Meter/MeterPro(CO2) devices
 - Environmental data posting to Mastodon
-- Metrics transmission to AWS CloudWatch
+- Structured log output for AWS CloudWatch Logs (for Metric Filters)
 - Battery status monitoring and alerts
 - Duplicate post prevention
 

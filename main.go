@@ -18,10 +18,6 @@ import (
 	"time"
 
 	"github.com/aws/aws-lambda-go/lambda"
-	"github.com/aws/aws-sdk-go-v2/aws"
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
-	"github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
 	"github.com/google/uuid"
 )
 
@@ -301,64 +297,30 @@ func fetchDeviceStatus(device SwitchBotDevice) (SwitchBotDeviceStatus, error) {
 }
 
 func PutMetric(ctx context.Context, device SwitchBotDevice, status SwitchBotDeviceStatus) error {
-	cfg, err := awsconfig.LoadDefaultConfig(ctx)
+	type MetricLog struct {
+		Type        string   `json:"type"`
+		DeviceID    string   `json:"deviceId"`
+		DeviceName  string   `json:"deviceName"`
+		Temperature *float64 `json:"temperature,omitempty"`
+		Humidity    *float64 `json:"humidity,omitempty"`
+		CO2         *int     `json:"co2,omitempty"`
+	}
+
+	metric := MetricLog{
+		Type:        "Metric",
+		DeviceID:    device.DeviceID,
+		DeviceName:  device.DeviceName,
+		Temperature: status.Temperature,
+		Humidity:    status.Humidity,
+		CO2:         status.CO2,
+	}
+
+	b, err := json.Marshal(metric)
 	if err != nil {
-		return fmt.Errorf("failed to load AWS config: %w", err)
-	}
-	cw := cloudwatch.NewFromConfig(cfg)
-
-	timestamp := aws.Time(time.Now())
-
-	var metricData []types.MetricDatum
-
-	if status.Temperature != nil {
-		metricData = append(metricData, types.MetricDatum{
-			MetricName: aws.String("Temperature"),
-			Dimensions: []types.Dimension{
-				{Name: aws.String("DeviceId"), Value: aws.String(device.DeviceID)},
-			},
-			Timestamp: timestamp,
-			Value:     aws.Float64(*status.Temperature),
-			Unit:      types.StandardUnitCount,
-		})
+		return fmt.Errorf("failed to marshal metric log: %w", err)
 	}
 
-	if status.Humidity != nil {
-		metricData = append(metricData, types.MetricDatum{
-			MetricName: aws.String("Humidity"),
-			Dimensions: []types.Dimension{
-				{Name: aws.String("DeviceId"), Value: aws.String(device.DeviceID)},
-			},
-			Timestamp: timestamp,
-			Value:     aws.Float64(*status.Humidity),
-			Unit:      types.StandardUnitPercent,
-		})
-	}
-
-	if status.CO2 != nil {
-		metricData = append(metricData, types.MetricDatum{
-			MetricName: aws.String("CO2"),
-			Dimensions: []types.Dimension{
-				{Name: aws.String("DeviceId"), Value: aws.String(device.DeviceID)},
-			},
-			Timestamp: timestamp,
-			Value:     aws.Float64(float64(*status.CO2)),
-			Unit:      types.StandardUnitCount,
-		})
-	}
-
-	if len(metricData) == 0 {
-		return nil
-	}
-
-	_, err = cw.PutMetricData(ctx, &cloudwatch.PutMetricDataInput{
-		Namespace:  aws.String("SwitchBotMetrics"),
-		MetricData: metricData,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to put metric data: %w", err)
-	}
-
+	fmt.Println(string(b))
 	return nil
 }
 
